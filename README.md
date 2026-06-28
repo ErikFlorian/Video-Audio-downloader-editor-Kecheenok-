@@ -11,3 +11,4 @@ Use it wisely, cuz yt-dlp itself violates youtubes EULA.
 Its made entirely from  python, and runs on any pc, whether its linux, windows or mac. 
 # Have fun, use it well, and leave a feedback :)
 # Kxnvra
+# I am so sorry its in czech, im sure yall figure it out :D
