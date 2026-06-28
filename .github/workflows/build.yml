@@ -20,7 +20,7 @@ jobs:
         run: pip install pyinstaller yt-dlp
 
       - name: Build .exe
-        run: pyinstaller --onefile --windowed --name "Kecinom" kecinom.py
+        run: pyinstaller --onefile --windowed --name "Kecinom" Kecheenok.py
 
       - name: Upload artefakt
         uses: actions/upload-artifact@v4
@@ -45,7 +45,7 @@ jobs:
 
       - name: Build .app
         run: |
-          pyinstaller --onefile --windowed --name "Kecinom" kecinom.py
+          pyinstaller --onefile --windowed --name "Kecinom" Kecheenok.py
           # Zabalíme .app do zipu, jinak upload-artifact ztratí permissions
           cd dist
           zip -r Kecinom-macOS.zip Kecinom.app
