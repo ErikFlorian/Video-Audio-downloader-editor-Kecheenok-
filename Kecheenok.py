@@ -6,29 +6,43 @@
 ██╔═██╗ ██╔══╝  ██║     ██║██║╚██╗██║██║   ██║██╔═██╗
 ██║  ██╗███████╗╚██████╗██║██║ ╚████║╚██████╔╝██║  ██╗
 ╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═╝
-  v3.0 — YouTube downloader & audio FX toolkit
+  v3.1 — YouTube downloader & audio FX toolkit
 """
+
+from __future__ import annotations
 
 import os
 import sys
+import shutil
 import subprocess
 import zipfile
 import urllib.request
 import threading
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
 import tkinter.font
+from tkinter import ttk, filedialog, messagebox
+
 
 # ---------------------------------------------------------------------------
-# customtkinter fallback
+# Pomocné funkce pro běh jako .exe (PyInstaller)
 # ---------------------------------------------------------------------------
-try:
-    import customtkinter as ctk
-    CTK = True
-    ctk.set_appearance_mode("dark")
-    ctk.set_default_color_theme("blue")
-except ImportError:
-    CTK = False
+FROZEN = getattr(sys, "frozen", False)
+CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
+
+def app_dir() -> str:
+    """Složka, kde leží .exe (nebo skript). Stabilnější než os.getcwd()."""
+    if FROZEN:
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def run_quiet(cmd, **kwargs):
+    """subprocess.run bez okna konzole a bez stdin (nutné pro --noconsole)."""
+    kwargs.setdefault("stdin", subprocess.DEVNULL)
+    if CREATE_NO_WINDOW:
+        kwargs.setdefault("creationflags", CREATE_NO_WINDOW)
+    return subprocess.run(cmd, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -48,20 +62,26 @@ TEXT      = "#dde3f0"
 MUTED     = "#55637a"
 DIM       = "#2a3447"
 
-def _best_mono():
-    r = tk.Tk(); r.withdraw()
-    avail = set(tkinter.font.families(r))
-    r.destroy()
+# Fonty se nastaví až po vytvoření hlavního okna (init_fonts)
+_MONO    = "TkFixedFont"
+FONT     = (_MONO, 10)
+FONT_SM  = (_MONO, 9)
+FONT_BIG = (_MONO, 13, "bold")
+FONT_LBL = ("Segoe UI", 10)
+
+
+def init_fonts(root: tk.Tk):
+    global _MONO, FONT, FONT_SM, FONT_BIG
+    avail = set(tkinter.font.families(root))
+    _MONO = "TkFixedFont"
     for f in ("Consolas", "JetBrains Mono", "Cascadia Code", "Courier New", "DejaVu Sans Mono"):
         if f in avail:
-            return f
-    return "TkFixedFont"
+            _MONO = f
+            break
+    FONT     = (_MONO, 10)
+    FONT_SM  = (_MONO, 9)
+    FONT_BIG = (_MONO, 13, "bold")
 
-_MONO = _best_mono()
-FONT      = (_MONO, 10)
-FONT_SM   = (_MONO, 9)
-FONT_BIG  = (_MONO, 13, "bold")
-FONT_LBL  = ("Segoe UI", 10)
 
 LOGO = (
     "██╗  ██╗███████╗ ██████╗██╗███╗   ██╗ ██████╗ ██╗  ██╗\n"
@@ -76,11 +96,11 @@ LOGO = (
 # Kvalita / formáty
 # ---------------------------------------------------------------------------
 QUALITY_MAP = {
-    "4K  (2160p)":     "bv*[vcodec^=avc][height<=2160]+ba[acodec^=mp4a]/best[ext=mp4]",
-    "FHD (1080p)":     "bv*[vcodec^=avc][height<=1080]+ba[acodec^=mp4a]/best[ext=mp4]",
-    "HD  (720p)":      "bv*[vcodec^=avc][height<=720]+ba[acodec^=mp4a]/best[ext=mp4]",
-    "SD  (480p)":      "bv*[vcodec^=avc][height<=480]+ba[acodec^=mp4a]/best[ext=mp4]",
-    "LOW (360p)":      "bv*[vcodec^=avc][height<=360]+ba[acodec^=mp4a]/best[ext=mp4]",
+    "4K  (2160p)":     "bv*[vcodec^=avc][height<=2160]+ba[acodec^=mp4a]/best[ext=mp4]/best",
+    "FHD (1080p)":     "bv*[vcodec^=avc][height<=1080]+ba[acodec^=mp4a]/best[ext=mp4]/best",
+    "HD  (720p)":      "bv*[vcodec^=avc][height<=720]+ba[acodec^=mp4a]/best[ext=mp4]/best",
+    "SD  (480p)":      "bv*[vcodec^=avc][height<=480]+ba[acodec^=mp4a]/best[ext=mp4]/best",
+    "LOW (360p)":      "bv*[vcodec^=avc][height<=360]+ba[acodec^=mp4a]/best[ext=mp4]/best",
     "MP3 (audio)":     "bestaudio/best",
     "FLAC (lossless)": "bestaudio/best",
     "WAV (raw)":       "bestaudio/best",
@@ -92,43 +112,81 @@ AUDIO_POSTPROC = {
     "WAV (raw)":       ("wav",  None),
 }
 
+AUDIO_EXTS = (".mp3", ".flac", ".wav", ".m4a", ".opus", ".ogg", ".aac")
+
 
 # ---------------------------------------------------------------------------
 # ffmpeg helpers
 # ---------------------------------------------------------------------------
 
-def is_ffmpeg_installed():
+def ffmpeg_local_bin() -> str:
+    return os.path.join(app_dir(), "ffmpeg_bin", "bin")
+
+
+def add_local_ffmpeg_to_path():
+    """Pokud už je ffmpeg stažený vedle programu, přidej ho do PATH."""
+    b = ffmpeg_local_bin()
+    if os.path.isdir(b) and b not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = b + os.pathsep + os.environ.get("PATH", "")
+
+
+def is_ffmpeg_installed() -> bool:
+    add_local_ffmpeg_to_path()
     try:
-        subprocess.run(["ffmpeg", "-version"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        run_quiet(["ffmpeg", "-version"],
+                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         return True
-    except (FileNotFoundError, subprocess.CalledProcessError):
+    except (FileNotFoundError, subprocess.CalledProcessError, OSError):
         return False
 
 
 def download_ffmpeg(log_cb):
+    if sys.platform != "win32":
+        log_cb("[WARN] ffmpeg nenalezen. Nainstaluj ho přes správce balíčků "
+               "(např. sudo apt install ffmpeg).")
+        return
+
     log_cb("[INFO] ffmpeg nenalezen — stahuji automaticky...")
-    ffmpeg_dir = os.path.join(os.getcwd(), "ffmpeg_bin")
+    ffmpeg_dir = os.path.join(app_dir(), "ffmpeg_bin")
     os.makedirs(ffmpeg_dir, exist_ok=True)
     zip_path = os.path.join(ffmpeg_dir, "ffmpeg.zip")
     url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
     log_cb(f"[INFO] Zdroj: {url}")
 
-    def _progress(count, block, total):
-        if total > 0:
-            pct = int(count * block * 100 / total)
-            log_cb(f"[INFO] Stahování ffmpeg... {min(pct, 100)}%", replace=True)
+    # Normální User-Agent, Python-urllib bývá blokovaný (403)
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    })
 
-    urllib.request.urlretrieve(url, zip_path, reporthook=_progress)
+    with urllib.request.urlopen(req, timeout=60) as resp, open(zip_path, "wb") as out:
+        total = int(resp.headers.get("Content-Length", 0))
+        done = 0
+        last_pct = -1
+        while True:
+            chunk = resp.read(1024 * 256)
+            if not chunk:
+                break
+            out.write(chunk)
+            done += len(chunk)
+            if total > 0:
+                pct = int(done * 100 / total)
+                if pct != last_pct:
+                    last_pct = pct
+                    log_cb(f"[INFO] Stahování ffmpeg... {min(pct, 100)}%", replace=True)
+
     log_cb("[INFO] Rozbaluji ffmpeg...")
-
     with zipfile.ZipFile(zip_path, "r") as zf:
         zf.extractall(ffmpeg_dir)
 
     extracted = next(
-        d for d in os.listdir(ffmpeg_dir)
-        if os.path.isdir(os.path.join(ffmpeg_dir, d)) and d != "bin"
+        (d for d in os.listdir(ffmpeg_dir)
+         if os.path.isdir(os.path.join(ffmpeg_dir, d)) and d != "bin"),
+        None,
     )
+    if extracted is None:
+        raise RuntimeError("Po rozbalení ffmpeg nebyla nalezena žádná složka.")
+
     bin_src = os.path.join(ffmpeg_dir, extracted, "bin")
     bin_dst = os.path.join(ffmpeg_dir, "bin")
     os.makedirs(bin_dst, exist_ok=True)
@@ -137,20 +195,16 @@ def download_ffmpeg(log_cb):
         src = os.path.join(bin_src, exe)
         dst = os.path.join(bin_dst, exe)
         if os.path.exists(src) and not os.path.exists(dst):
-            os.rename(src, dst)
+            shutil.move(src, dst)
 
+    try:
+        os.remove(zip_path)
+    except OSError:
+        pass
+
+    # Pouze pro běžící proces (žádné setx — ořezává a ničí systémový PATH)
     os.environ["PATH"] = bin_dst + os.pathsep + os.environ.get("PATH", "")
     log_cb(f"[INFO] ffmpeg připraven ✅  ({bin_dst})")
-
-    if sys.platform == "win32":
-        try:
-            subprocess.run(
-                f'setx PATH "%PATH%;{bin_dst}"',
-                shell=True, check=False,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-        except Exception:
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -163,16 +217,16 @@ def parse_time_to_seconds(s: str) -> float | None:
     if not s:
         return None
     try:
-        parts = s.split(":")
-        parts = [float(p) for p in parts]
-        if len(parts) == 1:
-            return parts[0]
-        elif len(parts) == 2:
-            return parts[0] * 60 + parts[1]
-        elif len(parts) == 3:
-            return parts[0] * 3600 + parts[1] * 60 + parts[2]
+        parts = [float(p) for p in s.split(":")]
     except ValueError:
         return None
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) == 2:
+        return parts[0] * 60 + parts[1]
+    if len(parts) == 3:
+        return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    return None
 
 
 def seconds_to_hhmmss(secs: float) -> str:
@@ -189,17 +243,18 @@ def seconds_to_hhmmss(secs: float) -> str:
 class KecInokApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Kečínok v3.0  ·  YouTube downloader & FX toolkit")
+        self.root.title("Kečínok v3.1  ·  YouTube downloader & FX toolkit")
         self.root.configure(bg=BG)
         self.root.resizable(True, True)
         self.root.minsize(760, 560)
 
         # ── State ──
-        self.url_rows:  list[dict] = []   # [{var, entry, frame}, ...]
-        self.out_dir    = tk.StringVar(value=os.path.join(os.getcwd(), "downloads"))
+        self.url_rows:  list[dict] = []
+        self.out_dir    = tk.StringVar(value=os.path.join(app_dir(), "downloads"))
         self.quality    = tk.StringVar(value="HD  (720p)")
         self.out_tmpl   = tk.StringVar(value="%(title)s [%(id)s].%(ext)s")
         self.running    = False
+        self._last_was_progress = False
 
         # Trim
         self.trim_enabled = tk.BooleanVar(value=False)
@@ -225,14 +280,17 @@ class KecInokApp:
     # ── ffmpeg async check ────────────────────────────────────────────────
 
     def _ensure_ffmpeg(self):
-        threading.Thread(
-            target=lambda: (
-                download_ffmpeg(self._log)
-                if not is_ffmpeg_installed()
-                else self._log("[CHECK] ffmpeg nalezen ✅")
-            ),
-            daemon=True,
-        ).start()
+        def _work():
+            try:
+                if is_ffmpeg_installed():
+                    self._log("[CHECK] ffmpeg nalezen ✅")
+                else:
+                    download_ffmpeg(self._log)
+            except Exception as e:
+                self._log(f"[ERROR] ❌ ffmpeg se nepodařilo připravit: {e}")
+                self._log("[TIP]  Stáhni ffmpeg ručně (gyan.dev) a dej ffmpeg.exe + "
+                          "ffprobe.exe do složky ffmpeg_bin\\bin vedle programu.")
+        threading.Thread(target=_work, daemon=True).start()
 
     # ── UI builder ────────────────────────────────────────────────────────
 
@@ -243,19 +301,17 @@ class KecInokApp:
         logo_frame = tk.Frame(root, bg=BG)
         logo_frame.pack(fill="x", pady=(10, 0))
 
-        logo_lbl = tk.Label(
+        tk.Label(
             logo_frame, text=LOGO,
             fg=ACCENT, bg=BG,
             font=(_MONO, 7), justify="center",
-        )
-        logo_lbl.pack()
+        ).pack()
 
-        subtitle = tk.Label(
+        tk.Label(
             logo_frame,
-            text="v3.0  ·  youtube downloader  ·  audio fx  ·  trim",
+            text="v3.1  ·  youtube downloader  ·  audio fx  ·  trim",
             fg=MUTED, bg=BG, font=FONT_SM,
-        )
-        subtitle.pack(pady=(2, 8))
+        ).pack(pady=(2, 8))
 
         # Divider
         tk.Frame(root, bg=BORDER, height=1).pack(fill="x", padx=12)
@@ -274,10 +330,10 @@ class KecInokApp:
         nb = ttk.Notebook(root)
         nb.pack(fill="both", expand=True, padx=8, pady=6)
 
-        self.tab_dl  = ttk.Frame(nb, style="TFrame")
-        self.tab_fx  = ttk.Frame(nb, style="TFrame")
+        self.tab_dl   = ttk.Frame(nb, style="TFrame")
+        self.tab_fx   = ttk.Frame(nb, style="TFrame")
         self.tab_trim = ttk.Frame(nb, style="TFrame")
-        self.tab_log = ttk.Frame(nb, style="TFrame")
+        self.tab_log  = ttk.Frame(nb, style="TFrame")
 
         nb.add(self.tab_dl,   text="  ⬇  Stahování  ")
         nb.add(self.tab_fx,   text="  🎛  Audio FX  ")
@@ -322,14 +378,13 @@ class KecInokApp:
         self.url_container.pack(fill="x", padx=10, pady=2)
         self._add_url_row()
 
-        add_btn = tk.Button(
+        tk.Button(
             f, text="＋  přidat URL",
             bg=SURFACE2, fg=ACCENT2,
             font=FONT_SM, bd=0, relief="flat", cursor="hand2",
             padx=10, pady=4,
             command=self._add_url_row,
-        )
-        add_btn.pack(anchor="w", padx=10, pady=(0, 4))
+        ).pack(anchor="w", padx=10, pady=(0, 4))
 
         # Kvalita
         self._section(f, "KVALITA / FORMÁT")
@@ -363,12 +418,11 @@ class KecInokApp:
         dir_frame = tk.Frame(f, bg=BG)
         dir_frame.pack(fill="x", padx=10, pady=4)
 
-        dir_entry = tk.Entry(
+        tk.Entry(
             dir_frame, textvariable=self.out_dir,
             bg=SURFACE2, fg=TEXT, insertbackground=ACCENT,
             font=FONT, bd=0, relief="flat",
-        )
-        dir_entry.pack(side="left", fill="x", expand=True, ipady=6, padx=(0, 6))
+        ).pack(side="left", fill="x", expand=True, ipady=6, padx=(0, 6))
 
         tk.Button(
             dir_frame, text="📁  procházet",
@@ -379,12 +433,11 @@ class KecInokApp:
         ).pack(side="left")
 
         self._section(f, "ŠABLONA SOUBORU")
-        tmpl_entry = tk.Entry(
+        tk.Entry(
             f, textvariable=self.out_tmpl,
             bg=SURFACE2, fg=TEXT, insertbackground=ACCENT,
             font=FONT, bd=0, relief="flat",
-        )
-        tmpl_entry.pack(fill="x", padx=10, pady=4, ipady=6)
+        ).pack(fill="x", padx=10, pady=4, ipady=6)
 
         tk.Label(
             f,
@@ -605,7 +658,6 @@ class KecInokApp:
 
         self._section(f, "OŘEZ ČASOVÉHO ÚSEKU")
 
-        # Enable toggle
         toggle_row = tk.Frame(f, bg=BG)
         toggle_row.pack(fill="x", padx=10, pady=8)
         tk.Checkbutton(
@@ -619,7 +671,6 @@ class KecInokApp:
             command=self._toggle_trim_ui,
         ).pack(anchor="w")
 
-        # Trim inputs
         self.trim_frame = tk.Frame(f, bg=SURFACE, bd=1, relief="flat")
         self.trim_frame.pack(fill="x", padx=10, pady=4)
 
@@ -647,27 +698,23 @@ class KecInokApp:
             font=(_MONO, 12), bd=0, relief="flat", width=14, justify="center",
         )
         self.trim_end_entry.grid(row=1, column=1, padx=8, ipady=8)
-        tk.Label(inner, text="HH:MM:SS  nebo sekundy  (prázdné = do konce)", fg=MUTED, bg=SURFACE, font=FONT_SM).grid(
-            row=1, column=2, sticky="w")
+        tk.Label(inner, text="HH:MM:SS  nebo sekundy  (prázdné = do konce)",
+                 fg=MUTED, bg=SURFACE, font=FONT_SM).grid(row=1, column=2, sticky="w")
 
         # Délka výpočet (live preview)
-        self.trim_duration_lbl = tk.Label(
-            inner, text="", fg=ACCENT, bg=SURFACE, font=FONT,
-        )
+        self.trim_duration_lbl = tk.Label(inner, text="", fg=ACCENT, bg=SURFACE, font=FONT)
         self.trim_duration_lbl.grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         self.trim_start.trace_add("write", self._update_trim_preview)
         self.trim_end.trace_add("write", self._update_trim_preview)
 
         # Příklady
-        examples_frame = tk.Frame(f, bg=BG)
-        examples_frame.pack(fill="x", padx=10, pady=8)
         self._section(f, "PŘÍKLADY")
         examples = [
-            ("Prvních 30 sekund",          "0",       "30"),
-            ("Od 1:30 do 4:00",            "1:30",    "4:00"),
-            ("Od 45 s do konce",           "45",      ""),
-            ("Minuty 10–15",               "10:00",   "15:00"),
+            ("Prvních 30 sekund",  "0",     "30"),
+            ("Od 1:30 do 4:00",    "1:30",  "4:00"),
+            ("Od 45 s do konce",   "45",    ""),
+            ("Minuty 10–15",       "10:00", "15:00"),
         ]
         eg_frame = tk.Frame(f, bg=BG)
         eg_frame.pack(fill="x", padx=10)
@@ -680,8 +727,10 @@ class KecInokApp:
 
             row = tk.Frame(eg_frame, bg=SURFACE2)
             row.pack(fill="x", pady=2)
-            tk.Label(row, text=label, fg=TEXT, bg=SURFACE2, font=FONT_SM, width=28, anchor="w").pack(side="left", padx=8)
-            tk.Label(row, text=f"start: {start or '—':>8}   konec: {end or 'EOF':>8}", fg=MUTED, bg=SURFACE2, font=FONT_SM).pack(side="left")
+            tk.Label(row, text=label, fg=TEXT, bg=SURFACE2, font=FONT_SM,
+                     width=28, anchor="w").pack(side="left", padx=8)
+            tk.Label(row, text=f"start: {start or '—':>8}   konec: {end or 'EOF':>8}",
+                     fg=MUTED, bg=SURFACE2, font=FONT_SM).pack(side="left")
             tk.Button(
                 row, text="použít",
                 bg=SURFACE3, fg=ACCENT, font=FONT_SM,
@@ -690,15 +739,12 @@ class KecInokApp:
             ).pack(side="right", padx=6, pady=3)
 
         # Poznámka
-        note = tk.Label(
+        tk.Label(
             f,
-            text=(
-                "  ℹ  Trim se provede přes ffmpeg po stažení.  "
-                "Pro přesný ořez je doporučeno stáhnout nejprve bez tranzích 效 a potom použít FX."
-            ),
+            text=("  ℹ  Trim se provede přes ffmpeg po stažení. U videa se kvůli přesnému "
+                  "ořezu překóduje obraz (trvá o něco déle), audio se ořezává rychle."),
             fg=MUTED, bg=BG, font=FONT_SM, anchor="w", wraplength=700, justify="left",
-        )
-        note.pack(fill="x", padx=10, pady=6)
+        ).pack(fill="x", padx=10, pady=6)
 
         self._toggle_trim_ui()
 
@@ -759,19 +805,18 @@ class KecInokApp:
         sb.pack(side="right", fill="y")
         self.log_text.pack(fill="both", expand=True, padx=2, pady=2)
 
-        self._log("Kečínok v3.0 ✅  připraven")
+        self._log("Kečínok v3.1 ✅  připraven")
         self._log("Přidej URL → vyber kvalitu → (volitelně FX/Trim) → SPUSTIT\n")
 
     def _log(self, msg: str, replace: bool = False):
+        """Thread-safe log. replace=True přepíše předchozí řádek (progress)."""
         def _do():
             self.log_text.config(state="normal")
-            if replace:
-                lines = self.log_text.get("1.0", "end-1c").split("\n")
-                if lines:
-                    self.log_text.delete(f"{len(lines)}.0", "end")
-                    self.log_text.insert("end", "\n" + msg)
-            else:
-                self.log_text.insert("end", msg + "\n")
+            if replace and self._last_was_progress:
+                # smaž poslední řádek (text končí "\n")
+                self.log_text.delete("end-2l linestart", "end-1c")
+            self.log_text.insert("end", msg + "\n")
+            self._last_was_progress = replace
             self.log_text.see("end")
             self.log_text.config(state="disabled")
         self.root.after(0, _do)
@@ -780,6 +825,7 @@ class KecInokApp:
         self.log_text.config(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.config(state="disabled")
+        self._last_was_progress = False
 
     def _set_status(self, msg: str):
         self.root.after(0, lambda: self.status_var.set(msg))
@@ -795,7 +841,7 @@ class KecInokApp:
 
     # ── Validace trimmingu ────────────────────────────────────────────────
 
-    def _validate_trim(self) -> tuple[float | None, float | None] | None:
+    def _validate_trim(self):
         """Vrátí (start_s, end_s) nebo None při chybě. end_s může být None."""
         if not self.trim_enabled.get():
             return (None, None)
@@ -826,7 +872,7 @@ class KecInokApp:
 
         trim = self._validate_trim()
         if trim is None:
-            return  # Chyba v trimmingu
+            return
 
         self.running = True
         self.run_btn.config(state="disabled", text="⏳  probíhá stahování...")
@@ -835,22 +881,48 @@ class KecInokApp:
 
     def _download_thread(self, urls: list[str], trim: tuple):
         import re
-        import shutil
         import tempfile
 
         def strip_ansi(s: str) -> str:
             return re.sub(r"\x1b\[[0-9;]*m", "", s or "")
 
+        app = self
+
+        class YDLLogger:
+            """Přesměruje výstup yt-dlp do logu (nutné pro --noconsole)."""
+            def debug(self, msg):
+                pass
+            def info(self, msg):
+                pass
+            def warning(self, msg):
+                app._log(f"[WARN] {strip_ansi(msg)}")
+            def error(self, msg):
+                app._log(f"[ERR]  {strip_ansi(msg)}")
+
+        tmp_dir = None
+        downloaded_files: list[str] = []
+
         try:
             try:
                 from yt_dlp import YoutubeDL
             except ImportError:
+                if FROZEN:
+                    raise RuntimeError(
+                        "yt-dlp není v .exe zabalený. Zkompiluj znovu s "
+                        "--collect-all yt_dlp."
+                    )
                 self._log("[INFO] Instaluji yt-dlp...")
-                subprocess.run(
+                run_quiet(
                     [sys.executable, "-m", "pip", "install", "yt-dlp"],
                     check=True, capture_output=True,
                 )
                 from yt_dlp import YoutubeDL
+
+            try:
+                from yt_dlp.version import __version__ as ytdlp_ver
+                self._log(f"[INFO] yt-dlp verze: {ytdlp_ver}")
+            except Exception:
+                pass
 
             quality   = self.quality.get()
             fmt       = QUALITY_MAP[quality]
@@ -861,17 +933,14 @@ class KecInokApp:
             trim_start_s, trim_end_s = trim
             apply_trim = trim_start_s is not None
 
-            # Pokud potřebujeme postprocessing (FX nebo trim), stáhni do tmp
             needs_postproc = apply_fx or apply_trim
             if needs_postproc:
-                tmp_dir = tempfile.mkdtemp(prefix="kecinom_")
+                tmp_dir = tempfile.mkdtemp(prefix="kecinok_")
                 dl_dir  = tmp_dir
             else:
-                tmp_dir = None
                 dl_dir  = out_dir
 
             os.makedirs(out_dir, exist_ok=True)
-            downloaded_files: list[str] = []
 
             def _pp_hook(d):
                 if d.get("status") == "finished":
@@ -900,7 +969,18 @@ class KecInokApp:
                 "merge_output_format":  "mp4",
                 "progress_hooks":       [_progress_hook],
                 "postprocessor_hooks":  [_pp_hook],
+                "logger":               YDLLogger(),
+                "noprogress":           True,
+                "retries":              10,
+                "fragment_retries":     10,
+                "extractor_retries":    3,
+                "socket_timeout":       30,
+                "extractor_args":       {"youtube": {"player_client": ["default", "web_safari"]}},
             }
+
+            local_bin = ffmpeg_local_bin()
+            if os.path.isdir(local_bin):
+                ydl_opts["ffmpeg_location"] = local_bin
 
             if quality in AUDIO_POSTPROC:
                 codec, bitrate = AUDIO_POSTPROC[quality]
@@ -925,15 +1005,14 @@ class KecInokApp:
 
             # ── Postprocessing: FX + Trim ──────────────────────────────────
             if needs_postproc and downloaded_files:
-                # Sestavíme ffmpeg argumenty
                 for src in downloaded_files:
                     name = os.path.basename(src)
                     dst  = os.path.join(out_dir, name)
+                    is_audio_file = name.lower().endswith(AUDIO_EXTS)
                     self._log(f"\n[PP]  {name}")
 
                     cmd = ["ffmpeg", "-y"]
 
-                    # Trim: vstupní -ss a -to jsou přesnější před -i
                     if apply_trim:
                         cmd += ["-ss", str(trim_start_s)]
                         if trim_end_s is not None:
@@ -943,17 +1022,26 @@ class KecInokApp:
 
                     cmd += ["-i", src]
                     cmd += ["-map", "0:v?", "-map", "0:a"]
-                    cmd += ["-c:v", "copy"]
+
+                    # Video: při trimu překódovat kvůli přesnosti (copy řeže po keyframech)
+                    if apply_trim and not is_audio_file:
+                        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]
+                    else:
+                        cmd += ["-c:v", "copy"]
 
                     if apply_fx:
                         self._log(f"      fx:   {fc}")
                         cmd += ["-af", fc]
+                        if name.lower().endswith(".mp3"):
+                            cmd += ["-b:a", "320k"]
+                        elif not is_audio_file:
+                            cmd += ["-c:a", "aac", "-b:a", "192k"]
                     else:
                         cmd += ["-c:a", "copy"]
 
                     cmd.append(dst)
 
-                    result = subprocess.run(
+                    result = run_quiet(
                         cmd,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
@@ -971,9 +1059,6 @@ class KecInokApp:
                     else:
                         self._log(f"[✅]  Hotovo: {name}")
 
-                if tmp_dir:
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-
             elif needs_postproc and not downloaded_files:
                 self._log("[WARN] Žádné soubory k postprocessingu.")
 
@@ -984,6 +1069,8 @@ class KecInokApp:
             self._log(f"\n[ERROR] ❌  {e}")
             self._set_status("chyba — viz Log")
         finally:
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
             self.running = False
             self.root.after(0, lambda: self.run_btn.config(
                 state="normal", text="⬇   SPUSTIT KEČÍNOK   ⬇",
@@ -995,16 +1082,18 @@ class KecInokApp:
 # ---------------------------------------------------------------------------
 
 def main():
+    # U --noconsole buildů je sys.stdout / sys.stderr None a print() by spadl
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w")
+
     print(__doc__)
 
-    if CTK:
-        root = ctk.CTk()
-        root.geometry("820x700")
-    else:
-        root = tk.Tk()
-        root.geometry("820x700")
-
+    root = tk.Tk()
+    root.geometry("820x700")
     root.minsize(760, 560)
+    init_fonts(root)
     KecInokApp(root)
     root.mainloop()
 
