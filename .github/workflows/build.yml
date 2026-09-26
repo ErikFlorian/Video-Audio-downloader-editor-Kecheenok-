@@ -20,13 +20,13 @@ jobs:
         run: pip install pyinstaller yt-dlp
 
       - name: Build .exe
-        run: pyinstaller --onefile --windowed --name "Kecinom" Kecheenok.py
+        run: pyinstaller --onefile --windowed --collect-all yt_dlp --name "KecheenokV2" KecheenokV2.py
 
       - name: Upload artefakt
         uses: actions/upload-artifact@v4
         with:
-          name: Kecinom-Windows
-          path: dist/Kecinom.exe
+          name: KecheenokV2-Windows
+          path: dist/KecheenokV2.exe
 
   build-macos:
     runs-on: macos-latest
@@ -45,13 +45,13 @@ jobs:
 
       - name: Build .app
         run: |
-          pyinstaller --onefile --windowed --name "Kecinom" Kecheenok.py
+          pyinstaller --onefile --windowed --collect-all yt_dlp --name "KecheenokV2" KecheenokV2.py
           # Zabalíme .app do zipu, jinak upload-artifact ztratí permissions
           cd dist
-          zip -r Kecinom-macOS.zip Kecinom.app
+          zip -r KecheenokV2-macOS.zip KecheenokV2.app
 
       - name: Upload artefakt
         uses: actions/upload-artifact@v4
         with:
-          name: Kecinom-macOS
-          path: dist/Kecinom-macOS.zip
+          name: KecheenokV2-macOS
+          path: dist/KecheenokV2-macOS.zip
